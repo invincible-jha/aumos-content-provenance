@@ -9,6 +9,7 @@ Services depend on interfaces, not concrete implementations.
 """
 
 import uuid
+from datetime import datetime
 from typing import Any, Protocol, runtime_checkable
 
 from aumos_content_provenance.core.models import (
@@ -492,6 +493,508 @@ class IAuditExportRepository(Protocol):
         ...
 
 
+# ---------------------------------------------------------------------------
+# Provenance Tracker Interface
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class IProvenanceTracker(Protocol):
+    """Interface for data source and transformation chain tracking."""
+
+    async def register_source(
+        self,
+        asset_id: str,
+        media_type: str,
+        actor: str,
+        content_bytes: bytes,
+        origin_url: str | None,
+        origin_timestamp: datetime | None,
+        metadata: dict[str, Any] | None,
+    ) -> Any:
+        """Register a source asset and record its origin metadata.
+
+        Args:
+            asset_id: Stable identifier for the asset.
+            media_type: MIME type of the content.
+            actor: Who/what is registering the source.
+            content_bytes: Raw bytes to hash for integrity.
+            origin_url: URL where the asset was obtained, if known.
+            origin_timestamp: When the asset was originally created.
+            metadata: Additional origin metadata.
+
+        Returns:
+            ProvenanceSource record.
+        """
+        ...
+
+    async def record_transformation(
+        self,
+        asset_id: str,
+        operation: str,
+        actor: str,
+        input_bytes: bytes,
+        output_bytes: bytes,
+        parameters: dict[str, Any] | None,
+    ) -> Any:
+        """Record a transformation step in the asset provenance chain.
+
+        Args:
+            asset_id: The asset being transformed.
+            operation: Name of the transformation operation.
+            actor: Who performed the transformation.
+            input_bytes: Content before transformation.
+            output_bytes: Content after transformation.
+            parameters: Transformation parameters.
+
+        Returns:
+            TransformationStep record.
+        """
+        ...
+
+    async def verify_chain_integrity(self, asset_id: str) -> Any:
+        """Verify the hash chain integrity for an asset.
+
+        Args:
+            asset_id: The asset to verify.
+
+        Returns:
+            TamperEvidence result with is_valid flag.
+        """
+        ...
+
+
+# ---------------------------------------------------------------------------
+# Tamper Detector Interface
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class ITamperDetector(Protocol):
+    """Interface for multi-method content tamper detection."""
+
+    async def detect_tampering(
+        self,
+        content_id: str,
+        content_bytes: bytes,
+        original_hash: str | None,
+        expected_watermark_payload: str | None,
+        expected_metadata: dict[str, Any] | None,
+    ) -> Any:
+        """Run full tamper detection suite on content.
+
+        Args:
+            content_id: Identifier for the content being analyzed.
+            content_bytes: Raw bytes to analyze.
+            original_hash: Known-good SHA-256 for comparison.
+            expected_watermark_payload: Expected watermark payload.
+            expected_metadata: Expected metadata fields.
+
+        Returns:
+            TamperReport with overall verdict and per-method indicators.
+        """
+        ...
+
+
+# ---------------------------------------------------------------------------
+# Metadata Embedder Interface
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class IMetadataEmbedder(Protocol):
+    """Interface for embedding provenance metadata into content files."""
+
+    async def embed_xmp(
+        self,
+        content_bytes: bytes,
+        provenance: Any,
+    ) -> Any:
+        """Embed provenance metadata as XMP fields in an image.
+
+        Args:
+            content_bytes: Raw image bytes.
+            provenance: ProvenanceMetadata to embed.
+
+        Returns:
+            EmbedResult with status and metadata hash.
+        """
+        ...
+
+    async def extract_metadata(
+        self,
+        content_bytes: bytes,
+        content_id: str,
+    ) -> Any:
+        """Extract provenance metadata from content.
+
+        Args:
+            content_bytes: Raw content bytes.
+            content_id: Expected content identifier.
+
+        Returns:
+            ExtractResult with extracted metadata.
+        """
+        ...
+
+
+# ---------------------------------------------------------------------------
+# Chain of Custody Interface
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class IChainOfCustody(Protocol):
+    """Interface for content ownership and transfer tracking."""
+
+    async def create_custody(
+        self,
+        asset_id: str,
+        owner_id: str,
+        purpose: str,
+        authorized_by: str,
+        metadata: dict[str, Any] | None,
+    ) -> Any:
+        """Establish initial custody of an asset.
+
+        Args:
+            asset_id: The asset to place under custody management.
+            owner_id: The initial owner.
+            purpose: Business purpose.
+            authorized_by: Who authorized this.
+            metadata: Additional context.
+
+        Returns:
+            CustodyRecord (root event).
+        """
+        ...
+
+    async def transfer_custody(
+        self,
+        asset_id: str,
+        new_owner_id: str,
+        purpose: str,
+        authorized_by: str,
+        metadata: dict[str, Any] | None,
+    ) -> Any:
+        """Transfer custody of an asset to a new owner.
+
+        Args:
+            asset_id: The asset being transferred.
+            new_owner_id: The new owner.
+            purpose: Business reason for transfer.
+            authorized_by: Who authorized the transfer.
+            metadata: Additional context.
+
+        Returns:
+            CustodyRecord (transfer event).
+        """
+        ...
+
+    async def validate_chain(self, asset_id: str) -> Any:
+        """Validate the full custody chain for an asset.
+
+        Args:
+            asset_id: The asset to validate.
+
+        Returns:
+            CustodyChain with is_valid and has_gaps flags.
+        """
+        ...
+
+    async def generate_attestation(
+        self,
+        asset_id: str,
+        attesting_owner_id: str,
+        validity_hours: int,
+    ) -> Any:
+        """Generate a signed custody attestation.
+
+        Args:
+            asset_id: The asset to attest.
+            attesting_owner_id: The owner generating the attestation.
+            validity_hours: Attestation validity window.
+
+        Returns:
+            CustodyAttestation with HMAC signature.
+        """
+        ...
+
+
+# ---------------------------------------------------------------------------
+# Retention Manager Interface
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class IRetentionManager(Protocol):
+    """Interface for record retention policy management."""
+
+    async def register_record(
+        self,
+        asset_id: str,
+        asset_type: str,
+        tenant_id: str,
+        policy_id: str,
+        acquired_at: datetime | None,
+    ) -> Any:
+        """Register a data record under a retention policy.
+
+        Args:
+            asset_id: The record to track.
+            asset_type: Category label.
+            tenant_id: Owning tenant.
+            policy_id: Retention policy to apply.
+            acquired_at: When the data was created.
+
+        Returns:
+            RetentionRecord.
+        """
+        ...
+
+    async def place_legal_hold(
+        self,
+        asset_id: str,
+        reason: str,
+        authorized_by: str,
+    ) -> Any:
+        """Place a legal hold preventing expiry-based purging.
+
+        Args:
+            asset_id: The asset to hold.
+            reason: Legal reason for the hold.
+            authorized_by: Who authorized this.
+
+        Returns:
+            Updated RetentionRecord.
+        """
+        ...
+
+    async def detect_expiring_records(
+        self,
+        tenant_id: str,
+        warning_days: int,
+    ) -> list[Any]:
+        """Detect records that are expiring soon or already expired.
+
+        Args:
+            tenant_id: The tenant to check.
+            warning_days: Days before expiry to warn.
+
+        Returns:
+            List of ExpiryNotification objects.
+        """
+        ...
+
+
+# ---------------------------------------------------------------------------
+# Lineage Resolver Interface
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class ILineageResolver(Protocol):
+    """Interface for training data lineage graph traversal."""
+
+    async def record_contribution(
+        self,
+        parent_node_id: str,
+        child_node_id: str,
+        relationship: Any,
+        tenant_id: str,
+        contribution_fraction: float,
+        metadata: dict[str, Any] | None,
+    ) -> Any:
+        """Record a lineage edge between two nodes.
+
+        Args:
+            parent_node_id: Upstream/source node.
+            child_node_id: Downstream/derived node.
+            relationship: Relationship type enum value.
+            tenant_id: Owning tenant.
+            contribution_fraction: Fraction of child from this parent.
+            metadata: Edge metadata.
+
+        Returns:
+            LineageEdge record.
+        """
+        ...
+
+    async def get_upstream_graph(
+        self,
+        node_id: str,
+        tenant_id: str,
+        max_depth: int | None,
+    ) -> Any:
+        """Traverse the lineage graph upstream from a node.
+
+        Args:
+            node_id: Starting node.
+            tenant_id: Owning tenant.
+            max_depth: Maximum traversal depth.
+
+        Returns:
+            LineageGraphResult with all ancestor nodes and edges.
+        """
+        ...
+
+    async def analyze_impact(
+        self,
+        source_node_id: str,
+        tenant_id: str,
+    ) -> Any:
+        """Analyze downstream impact of a source node change.
+
+        Args:
+            source_node_id: The node that may change.
+            tenant_id: Owning tenant.
+
+        Returns:
+            ImpactAnalysis with affected node counts.
+        """
+        ...
+
+
+# ---------------------------------------------------------------------------
+# License Checker Interface
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class ILicenseChecker(Protocol):
+    """Interface for license compliance analysis."""
+
+    async def detect_license(
+        self,
+        content_id: str,
+        license_identifier: str,
+        copyright_holders: list[str] | None,
+    ) -> Any:
+        """Look up a license profile by SPDX identifier.
+
+        Args:
+            content_id: The content being analyzed.
+            license_identifier: SPDX license identifier.
+            copyright_holders: Known copyright holders.
+
+        Returns:
+            LicenseProfile or None if unrecognized.
+        """
+        ...
+
+    async def check_compatibility(
+        self,
+        license_a: str,
+        license_b: str,
+        use_case: Any,
+    ) -> Any:
+        """Check compatibility between two licenses for a use case.
+
+        Args:
+            license_a: First SPDX identifier.
+            license_b: Second SPDX identifier.
+            use_case: Intended use case enum value.
+
+        Returns:
+            CompatibilityResult with verdict and restrictions.
+        """
+        ...
+
+    async def detect_violations(
+        self,
+        content_licenses: list[dict[str, Any]],
+        use_case: Any,
+    ) -> list[dict[str, Any]]:
+        """Detect license violations across a collection of content.
+
+        Args:
+            content_licenses: List of dicts with content_id and license keys.
+            use_case: Intended use case.
+
+        Returns:
+            List of violation dicts.
+        """
+        ...
+
+
+# ---------------------------------------------------------------------------
+# Audit Reporter Interface
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class IProvenanceAuditReporter(Protocol):
+    """Interface for court-admissible audit trail generation."""
+
+    async def compile_audit_trail(
+        self,
+        tenant_id: str,
+        scope: Any,
+        provenance_records: list[dict[str, Any]] | None,
+        lineage_records: list[dict[str, Any]] | None,
+        license_records: list[dict[str, Any]] | None,
+        custody_records: list[dict[str, Any]] | None,
+        filter_content_ids: list[str] | None,
+    ) -> list[Any]:
+        """Compile all available evidence into typed AuditRecord objects.
+
+        Args:
+            tenant_id: The owning tenant.
+            scope: Which evidence categories to include.
+            provenance_records: C2PA provenance data dicts.
+            lineage_records: Lineage edge dicts.
+            license_records: License compliance check dicts.
+            custody_records: Chain of custody event dicts.
+            filter_content_ids: Optional content ID filter.
+
+        Returns:
+            List of AuditRecord objects.
+        """
+        ...
+
+    async def package_evidence(
+        self,
+        tenant_id: str,
+        scope: Any,
+        audit_records: list[Any],
+    ) -> Any:
+        """Assemble a ZIP evidence package from audit records.
+
+        Args:
+            tenant_id: The owning tenant.
+            scope: Evidence scope.
+            audit_records: Records to package.
+
+        Returns:
+            EvidencePackage with ZIP bytes and integrity manifest.
+        """
+        ...
+
+    async def generate_expert_witness_report(
+        self,
+        tenant_id: str,
+        scope: Any,
+        audit_records: list[Any],
+        expert_name: str,
+        case_reference: str,
+        jurisdiction: str,
+    ) -> Any:
+        """Generate a structured expert witness report.
+
+        Args:
+            tenant_id: The owning tenant.
+            scope: Evidence scope.
+            audit_records: Evidence records to analyze.
+            expert_name: Expert witness name.
+            case_reference: Court case reference.
+            jurisdiction: Legal jurisdiction.
+
+        Returns:
+            ExpertWitnessReport with signed attestation.
+        """
+        ...
+
+
 __all__ = [
     "IC2PAClient",
     "IWatermarkEngine",
@@ -500,4 +1003,12 @@ __all__ = [
     "ILineageRepository",
     "ILicenseRepository",
     "IAuditExportRepository",
+    "IProvenanceTracker",
+    "ITamperDetector",
+    "IMetadataEmbedder",
+    "IChainOfCustody",
+    "IRetentionManager",
+    "ILineageResolver",
+    "ILicenseChecker",
+    "IProvenanceAuditReporter",
 ]

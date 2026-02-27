@@ -9,6 +9,14 @@ Services:
 - LineageService: Track and query training data lineage chains
 - LicenseComplianceService: Check and report on training data license risk
 - AuditExportService: Generate court-admissible audit trail packages
+- ProvenanceTrackingService: Source registration and transformation chain management
+- TamperDetectionService: Multi-method content integrity verification
+- MetadataEmbeddingService: Embed/extract provenance metadata from content files
+- CustodyService: Ownership transfer tracking and signed attestations
+- RetentionService: Record retention policy management and legal holds
+- LineageResolverService: Training data lineage graph traversal and impact analysis
+- LicenseCheckerService: License compatibility analysis and compliance certificates
+- FullAuditService: Court-admissible audit trail compilation and expert reports
 """
 
 import hashlib
@@ -24,9 +32,17 @@ from aumos_common.observability import get_logger
 from aumos_content_provenance.core.interfaces import (
     IAuditExportRepository,
     IC2PAClient,
+    IChainOfCustody,
+    ILicenseChecker,
     ILicenseRepository,
     ILineageRepository,
+    ILineageResolver,
+    IMetadataEmbedder,
+    IProvenanceAuditReporter,
     IProvenanceRepository,
+    IProvenanceTracker,
+    IRetentionManager,
+    ITamperDetector,
     IWatermarkEngine,
     IWatermarkRepository,
 )
@@ -911,6 +927,988 @@ class AuditExportService:
         return package
 
 
+# ---------------------------------------------------------------------------
+# ProvenanceTrackingService
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ChainVerificationResult:
+    """Result of a provenance chain verification request."""
+
+    asset_id: str
+    is_valid: bool
+    chain_length: int
+    broken_at_step: int | None
+    reason: str
+
+
+class ProvenanceTrackingService:
+    """Track data source and transformation chains for content assets.
+
+    Orchestrates the ProvenanceTracker adapter to record the full
+    lifecycle of content from initial registration through all
+    transformation steps.
+    """
+
+    def __init__(self, tracker: IProvenanceTracker) -> None:
+        self._tracker = tracker
+
+    async def register_asset(
+        self,
+        asset_id: str,
+        media_type: str,
+        actor: str,
+        content_bytes: bytes,
+        origin_url: str | None = None,
+        origin_timestamp: datetime | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> Any:
+        """Register a source asset and begin provenance tracking.
+
+        Args:
+            asset_id: Stable identifier for the asset.
+            media_type: MIME type of the content.
+            actor: Who/what is registering the source.
+            content_bytes: Raw bytes to hash for integrity anchoring.
+            origin_url: URL where the asset was obtained.
+            origin_timestamp: When the asset was originally created.
+            metadata: Additional origin metadata.
+
+        Returns:
+            ProvenanceSource record.
+
+        Raises:
+            ValidationError: If asset_id is blank or content_bytes is empty.
+        """
+        if not asset_id.strip():
+            raise ValidationError("asset_id cannot be blank")
+        if not content_bytes:
+            raise ValidationError("content_bytes cannot be empty")
+
+        logger.info(
+            "Registering asset for provenance tracking",
+            asset_id=asset_id,
+            media_type=media_type,
+            actor=actor,
+        )
+
+        return await self._tracker.register_source(
+            asset_id=asset_id,
+            media_type=media_type,
+            actor=actor,
+            content_bytes=content_bytes,
+            origin_url=origin_url,
+            origin_timestamp=origin_timestamp,
+            metadata=metadata,
+        )
+
+    async def record_step(
+        self,
+        asset_id: str,
+        operation: str,
+        actor: str,
+        input_bytes: bytes,
+        output_bytes: bytes,
+        parameters: dict[str, Any] | None = None,
+    ) -> Any:
+        """Record a transformation step in the asset's provenance chain.
+
+        Args:
+            asset_id: The asset being transformed.
+            operation: Name of the transformation operation.
+            actor: Who performed the transformation.
+            input_bytes: Content before the transformation.
+            output_bytes: Content after the transformation.
+            parameters: Transformation parameters.
+
+        Returns:
+            TransformationStep record.
+
+        Raises:
+            ValidationError: If operation name is blank.
+        """
+        if not operation.strip():
+            raise ValidationError("operation name cannot be blank")
+
+        return await self._tracker.record_transformation(
+            asset_id=asset_id,
+            operation=operation,
+            actor=actor,
+            input_bytes=input_bytes,
+            output_bytes=output_bytes,
+            parameters=parameters,
+        )
+
+    async def verify_chain(self, asset_id: str) -> ChainVerificationResult:
+        """Verify the hash chain integrity for an asset's provenance chain.
+
+        Args:
+            asset_id: The asset to verify.
+
+        Returns:
+            ChainVerificationResult with validation status and details.
+        """
+        evidence = await self._tracker.verify_chain_integrity(asset_id=asset_id)
+
+        return ChainVerificationResult(
+            asset_id=asset_id,
+            is_valid=evidence.is_valid,
+            chain_length=getattr(evidence, "chain_length", 0),
+            broken_at_step=evidence.broken_at_step,
+            reason=evidence.reason,
+        )
+
+
+# ---------------------------------------------------------------------------
+# TamperDetectionService
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TamperCheckResult:
+    """Service-level result for a tamper detection check."""
+
+    content_id: str
+    tampered: bool
+    confidence: float
+    severity: str
+    indicator_count: int
+    affected_regions: int
+    report_id: str
+
+
+class TamperDetectionService:
+    """Detect content tampering using multi-method cryptographic analysis.
+
+    Wraps the TamperDetector adapter and adds provenance record lookup
+    for original hash retrieval.
+    """
+
+    def __init__(
+        self,
+        detector: ITamperDetector,
+        provenance_repository: IProvenanceRepository,
+    ) -> None:
+        self._detector = detector
+        self._provenance_repo = provenance_repository
+
+    async def check_content_integrity(
+        self,
+        tenant_id: uuid.UUID,
+        content_id: str,
+        content_bytes: bytes,
+        check_watermark: bool = False,
+        expected_watermark_payload: str | None = None,
+    ) -> TamperCheckResult:
+        """Check whether content has been tampered with.
+
+        Retrieves the original hash from the provenance record and runs
+        the full tamper detection suite.
+
+        Args:
+            tenant_id: The owning tenant.
+            content_id: The content to verify.
+            content_bytes: Current content bytes to analyze.
+            check_watermark: Whether to include watermark integrity check.
+            expected_watermark_payload: Expected watermark payload string.
+
+        Returns:
+            TamperCheckResult with overall verdict.
+        """
+        original_hash: str | None = None
+        provenance_record = await self._provenance_repo.get_by_content_id(
+            content_id=content_id,
+            tenant_id=tenant_id,
+        )
+        if provenance_record is not None:
+            original_hash = provenance_record.content_hash
+
+        watermark_payload = expected_watermark_payload if check_watermark else None
+
+        report = await self._detector.detect_tampering(
+            content_id=content_id,
+            content_bytes=content_bytes,
+            original_hash=original_hash,
+            expected_watermark_payload=watermark_payload,
+            expected_metadata=None,
+        )
+
+        logger.info(
+            "Tamper check complete",
+            tenant_id=str(tenant_id),
+            content_id=content_id,
+            tampered=report.overall_tampered,
+            confidence=report.overall_confidence,
+        )
+
+        return TamperCheckResult(
+            content_id=content_id,
+            tampered=report.overall_tampered,
+            confidence=report.overall_confidence,
+            severity=report.severity.value,
+            indicator_count=len(report.indicators),
+            affected_regions=len(report.affected_regions),
+            report_id=report.report_id,
+        )
+
+
+# ---------------------------------------------------------------------------
+# MetadataEmbeddingService
+# ---------------------------------------------------------------------------
+
+
+class MetadataEmbeddingService:
+    """Embed and extract provenance metadata from content files.
+
+    Orchestrates the MetadataEmbedder adapter, selecting the appropriate
+    embedding format based on content type and retrieving provenance data
+    from the repository.
+    """
+
+    def __init__(
+        self,
+        embedder: IMetadataEmbedder,
+        provenance_repository: IProvenanceRepository,
+    ) -> None:
+        self._embedder = embedder
+        self._provenance_repo = provenance_repository
+
+    async def embed_provenance_metadata(
+        self,
+        tenant_id: uuid.UUID,
+        content_id: str,
+        content_bytes: bytes,
+        format_hint: str = "xmp",
+    ) -> Any:
+        """Embed provenance metadata from the provenance record into content.
+
+        Retrieves the existing provenance record and embeds its fields
+        into the content using the appropriate format.
+
+        Args:
+            tenant_id: The owning tenant.
+            content_id: The content to embed metadata into.
+            content_bytes: Raw content bytes.
+            format_hint: Embedding format hint ("xmp", "exif", "id3", "mp4").
+
+        Returns:
+            EmbedResult from the embedder adapter.
+
+        Raises:
+            NotFoundError: If no provenance record exists for this content.
+        """
+        from aumos_content_provenance.adapters.metadata_embedder import (
+            EmbedFormat,
+            ProvenanceMetadata,
+        )
+
+        record = await self._provenance_repo.get_by_content_id(
+            content_id=content_id,
+            tenant_id=tenant_id,
+        )
+        if record is None:
+            raise NotFoundError(f"No provenance record found for content '{content_id}'")
+
+        provenance_meta = ProvenanceMetadata(
+            content_id=content_id,
+            tenant_id=str(tenant_id),
+            signer_id=record.signer_id,
+            content_hash=record.content_hash,
+            manifest_uri=record.manifest_uri,
+            signed_at=record.signed_at,
+        )
+
+        if format_hint == "exif":
+            return await self._embedder.embed_xmp(content_bytes, provenance_meta)
+        # Default to XMP
+        return await self._embedder.embed_xmp(content_bytes, provenance_meta)
+
+    async def extract_provenance_metadata(
+        self,
+        content_id: str,
+        content_bytes: bytes,
+    ) -> Any:
+        """Extract embedded provenance metadata from content.
+
+        Args:
+            content_id: Expected content ID for annotation.
+            content_bytes: Raw content bytes.
+
+        Returns:
+            ExtractResult with extracted metadata and verification status.
+        """
+        return await self._embedder.extract_metadata(
+            content_bytes=content_bytes,
+            content_id=content_id,
+        )
+
+
+# ---------------------------------------------------------------------------
+# CustodyService
+# ---------------------------------------------------------------------------
+
+
+class CustodyService:
+    """Track content ownership and generate signed custody attestations.
+
+    Wraps the ChainOfCustody adapter with service-level validation,
+    logging, and integration with provenance records.
+    """
+
+    def __init__(self, custody: IChainOfCustody) -> None:
+        self._custody = custody
+
+    async def establish_custody(
+        self,
+        asset_id: str,
+        owner_id: str,
+        purpose: str,
+        authorized_by: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> Any:
+        """Establish initial custody for an asset.
+
+        Args:
+            asset_id: The asset identifier.
+            owner_id: The initial owner.
+            purpose: Business purpose for custody.
+            authorized_by: Who authorized this.
+            metadata: Additional context.
+
+        Returns:
+            CustodyRecord (root event).
+
+        Raises:
+            ValidationError: If asset_id or owner_id is blank.
+        """
+        if not asset_id.strip():
+            raise ValidationError("asset_id cannot be blank")
+        if not owner_id.strip():
+            raise ValidationError("owner_id cannot be blank")
+
+        logger.info(
+            "Establishing custody",
+            asset_id=asset_id,
+            owner_id=owner_id,
+            purpose=purpose,
+        )
+
+        return await self._custody.create_custody(
+            asset_id=asset_id,
+            owner_id=owner_id,
+            purpose=purpose,
+            authorized_by=authorized_by,
+            metadata=metadata,
+        )
+
+    async def transfer(
+        self,
+        asset_id: str,
+        new_owner_id: str,
+        purpose: str,
+        authorized_by: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> Any:
+        """Transfer custody to a new owner.
+
+        Args:
+            asset_id: The asset being transferred.
+            new_owner_id: The new owner.
+            purpose: Business reason.
+            authorized_by: Who authorized this.
+            metadata: Additional context.
+
+        Returns:
+            CustodyRecord (transfer event).
+        """
+        return await self._custody.transfer_custody(
+            asset_id=asset_id,
+            new_owner_id=new_owner_id,
+            purpose=purpose,
+            authorized_by=authorized_by,
+            metadata=metadata,
+        )
+
+    async def get_attestation(
+        self,
+        asset_id: str,
+        owner_id: str,
+        validity_hours: int = 24,
+    ) -> Any:
+        """Generate a signed custody attestation for legal use.
+
+        Args:
+            asset_id: The asset to attest.
+            owner_id: The attesting owner.
+            validity_hours: Attestation validity period.
+
+        Returns:
+            CustodyAttestation with HMAC signature.
+        """
+        return await self._custody.generate_attestation(
+            asset_id=asset_id,
+            attesting_owner_id=owner_id,
+            validity_hours=validity_hours,
+        )
+
+
+# ---------------------------------------------------------------------------
+# RetentionService
+# ---------------------------------------------------------------------------
+
+
+class RetentionService:
+    """Manage data retention policies and compliance.
+
+    Wraps the RetentionManager adapter with service-level validation
+    and integration with provenance and audit record lifecycles.
+    """
+
+    def __init__(self, retention_manager: IRetentionManager) -> None:
+        self._manager = retention_manager
+
+    async def register_provenance_record(
+        self,
+        asset_id: str,
+        tenant_id: str,
+        policy_id: str,
+        acquired_at: datetime | None = None,
+    ) -> Any:
+        """Register a provenance record under retention management.
+
+        Args:
+            asset_id: The provenance record identifier.
+            tenant_id: The owning tenant.
+            policy_id: Retention policy to apply.
+            acquired_at: When the record was created.
+
+        Returns:
+            RetentionRecord.
+        """
+        return await self._manager.register_record(
+            asset_id=asset_id,
+            asset_type="provenance",
+            tenant_id=tenant_id,
+            policy_id=policy_id,
+            acquired_at=acquired_at,
+        )
+
+    async def apply_legal_hold(
+        self,
+        asset_id: str,
+        reason: str,
+        authorized_by: str,
+    ) -> Any:
+        """Apply a legal hold to prevent expiry-based purging.
+
+        Args:
+            asset_id: The asset to hold.
+            reason: Legal reason for the hold.
+            authorized_by: Who authorized this hold.
+
+        Returns:
+            Updated RetentionRecord.
+        """
+        logger.info(
+            "Applying legal hold",
+            asset_id=asset_id,
+            reason=reason,
+            authorized_by=authorized_by,
+        )
+
+        return await self._manager.place_legal_hold(
+            asset_id=asset_id,
+            reason=reason,
+            authorized_by=authorized_by,
+        )
+
+    async def get_expiry_notifications(
+        self,
+        tenant_id: str,
+        warning_days: int = 30,
+    ) -> list[Any]:
+        """Get expiry notifications for records approaching their retention limit.
+
+        Args:
+            tenant_id: The tenant to check.
+            warning_days: Days before expiry to start warning.
+
+        Returns:
+            List of ExpiryNotification objects.
+        """
+        return await self._manager.detect_expiring_records(
+            tenant_id=tenant_id,
+            warning_days=warning_days,
+        )
+
+
+# ---------------------------------------------------------------------------
+# LineageResolverService
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class LineageImpactResult:
+    """Result of a lineage impact analysis."""
+
+    source_node_id: str
+    affected_count: int
+    affected_node_ids: list[str]
+    affected_by_type: dict[str, int]
+    max_depth: int
+
+
+class LineageResolverService:
+    """Resolve training data lineage graphs and perform impact analysis.
+
+    Wraps the LineageResolver adapter with service-level validation
+    and coordinates with the repository for persistent lineage storage.
+    """
+
+    def __init__(
+        self,
+        resolver: ILineageResolver,
+        lineage_repository: ILineageRepository,
+    ) -> None:
+        self._resolver = resolver
+        self._lineage_repo = lineage_repository
+
+    async def map_training_contribution(
+        self,
+        tenant_id: uuid.UUID,
+        parent_node_id: str,
+        child_node_id: str,
+        relationship: str,
+        contribution_fraction: float = 1.0,
+        metadata: dict[str, Any] | None = None,
+    ) -> Any:
+        """Record that a parent node (dataset/model) contributed to a child node.
+
+        Also writes to the lineage repository for persistent storage.
+
+        Args:
+            tenant_id: The owning tenant.
+            parent_node_id: Source node identifier.
+            child_node_id: Derived node identifier.
+            relationship: Relationship label (must match LineageRelationship).
+            contribution_fraction: Fraction of child from this parent (0.0–1.0).
+            metadata: Additional edge metadata.
+
+        Returns:
+            LineageEdge from the resolver.
+        """
+        from aumos_content_provenance.adapters.lineage_resolver import LineageRelationship
+        from aumos_content_provenance.core.models import LineageNodeType
+
+        try:
+            relationship_enum = LineageRelationship(relationship)
+        except ValueError:
+            raise ValidationError(
+                f"Invalid relationship '{relationship}'. "
+                f"Must be one of: {[r.value for r in LineageRelationship]}"
+            )
+
+        # Also record in the persistent repository
+        await self._lineage_repo.create(
+            tenant_id=tenant_id,
+            parent_node_id=parent_node_id,
+            parent_node_type=LineageNodeType.TRAINING_DATASET,
+            child_node_id=child_node_id,
+            child_node_type=LineageNodeType.MODEL,
+            relationship=relationship,
+            metadata=metadata or {},
+        )
+
+        return await self._resolver.record_contribution(
+            parent_node_id=parent_node_id,
+            child_node_id=child_node_id,
+            relationship=relationship_enum,
+            tenant_id=str(tenant_id),
+            contribution_fraction=contribution_fraction,
+            metadata=metadata,
+        )
+
+    async def get_full_lineage(
+        self,
+        tenant_id: uuid.UUID,
+        node_id: str,
+        max_depth: int = 10,
+    ) -> Any:
+        """Retrieve the full upstream lineage graph for a node.
+
+        Args:
+            tenant_id: The owning tenant.
+            node_id: The node to trace lineage for.
+            max_depth: Maximum traversal depth.
+
+        Returns:
+            LineageGraphResult with all ancestor nodes and edges.
+        """
+        return await self._resolver.get_upstream_graph(
+            node_id=node_id,
+            tenant_id=str(tenant_id),
+            max_depth=max_depth,
+        )
+
+    async def analyze_source_impact(
+        self,
+        tenant_id: uuid.UUID,
+        source_node_id: str,
+    ) -> LineageImpactResult:
+        """Analyze downstream impact if a source dataset changes.
+
+        Useful for license risk propagation: if a CC-BY-NC dataset is
+        discovered in the training chain, what models are affected?
+
+        Args:
+            tenant_id: The owning tenant.
+            source_node_id: The source node that may change.
+
+        Returns:
+            LineageImpactResult with affected node counts.
+        """
+        impact = await self._resolver.analyze_impact(
+            source_node_id=source_node_id,
+            tenant_id=str(tenant_id),
+        )
+
+        return LineageImpactResult(
+            source_node_id=source_node_id,
+            affected_count=impact.affected_count,
+            affected_node_ids=impact.affected_node_ids,
+            affected_by_type=impact.affected_by_type,
+            max_depth=impact.max_depth_affected,
+        )
+
+
+# ---------------------------------------------------------------------------
+# LicenseCheckerService
+# ---------------------------------------------------------------------------
+
+
+class LicenseCheckerService:
+    """Analyze license compliance and generate compliance certificates.
+
+    Wraps the LicenseChecker adapter and integrates with the license
+    repository for persistent compliance record storage.
+    """
+
+    def __init__(
+        self,
+        checker: ILicenseChecker,
+        license_repository: ILicenseRepository,
+    ) -> None:
+        self._checker = checker
+        self._license_repo = license_repository
+
+    async def analyze_content_license(
+        self,
+        tenant_id: uuid.UUID,
+        content_id: str,
+        license_spdx: str,
+        copyright_holders: list[str] | None = None,
+        content_url: str | None = None,
+    ) -> LicenseCheck:
+        """Detect and store a license compliance analysis for a content item.
+
+        Args:
+            tenant_id: The owning tenant.
+            content_id: The content being analyzed.
+            license_spdx: SPDX license identifier.
+            copyright_holders: Known copyright holders.
+            content_url: Source URL for the content.
+
+        Returns:
+            Persisted LicenseCheck record.
+        """
+        profile = await self._checker.detect_license(
+            content_id=content_id,
+            license_identifier=license_spdx,
+            copyright_holders=copyright_holders,
+        )
+
+        risk_score = profile.risk_score if profile else 0.95
+        flags: list[str] = []
+        recommendation = "Unknown license — assume all rights reserved"
+
+        if profile:
+            if not profile.allows_commercial:
+                flags.append("no_commercial_use")
+            if not profile.allows_derivatives:
+                flags.append("no_derivatives")
+            if profile.requires_share_alike:
+                flags.append("share_alike_copyleft")
+            if not profile.allows_ai_training:
+                flags.append("training_use_restricted")
+            if profile.risk_score >= 0.8:
+                recommendation = "High litigation risk. Obtain legal review before use."
+            elif profile.risk_score >= 0.5:
+                recommendation = "Review license terms before training use."
+            else:
+                recommendation = "Safe for documented training use."
+        else:
+            flags.append("no_license_detected")
+
+        risk_level_map = {
+            True: LicenseRisk.LOW if risk_score < 0.3 else LicenseRisk.MEDIUM,
+        }
+        if risk_score >= 0.8:
+            license_risk = LicenseRisk.CRITICAL
+        elif risk_score >= 0.6:
+            license_risk = LicenseRisk.HIGH
+        elif risk_score >= 0.3:
+            license_risk = LicenseRisk.MEDIUM
+        else:
+            license_risk = LicenseRisk.LOW
+
+        return await self._license_repo.create(
+            tenant_id=tenant_id,
+            content_id=content_id,
+            content_url=content_url,
+            detected_license=license_spdx,
+            license_risk=license_risk,
+            risk_score=risk_score,
+            copyright_holders=copyright_holders or [],
+            flags=flags,
+            recommendation=recommendation,
+        )
+
+    async def check_license_compatibility(
+        self,
+        license_a: str,
+        license_b: str,
+        use_case: str = "ai_training",
+    ) -> Any:
+        """Check compatibility between two licenses for a given use case.
+
+        Args:
+            license_a: First SPDX identifier.
+            license_b: Second SPDX identifier.
+            use_case: Use case string matching UseCase enum values.
+
+        Returns:
+            CompatibilityResult with verdict.
+        """
+        from aumos_content_provenance.adapters.license_checker import UseCase
+
+        try:
+            use_case_enum = UseCase(use_case)
+        except ValueError:
+            raise ValidationError(
+                f"Invalid use_case '{use_case}'. "
+                f"Must be one of: {[u.value for u in UseCase]}"
+            )
+
+        return await self._checker.check_compatibility(
+            license_a=license_a,
+            license_b=license_b,
+            use_case=use_case_enum,
+        )
+
+
+# ---------------------------------------------------------------------------
+# FullAuditService
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class FullAuditResult:
+    """Result of a full audit trail generation."""
+
+    package_id: str
+    tenant_id: str
+    record_count: int
+    zip_hash: str | None
+    scope: str
+    generated_at: datetime
+
+
+class FullAuditService:
+    """Generate court-admissible audit trail packages and expert witness reports.
+
+    Integrates the ProvenanceAuditReporter with all repository adapters
+    to compile comprehensive evidence packages for legal proceedings.
+    """
+
+    def __init__(
+        self,
+        reporter: IProvenanceAuditReporter,
+        provenance_repository: IProvenanceRepository,
+        lineage_repository: ILineageRepository,
+        license_repository: ILicenseRepository,
+    ) -> None:
+        self._reporter = reporter
+        self._provenance_repo = provenance_repository
+        self._lineage_repo = lineage_repository
+        self._license_repo = license_repository
+
+    async def generate_full_evidence_package(
+        self,
+        tenant_id: uuid.UUID,
+        scope: str = "full",
+        filter_content_ids: list[str] | None = None,
+    ) -> FullAuditResult:
+        """Compile and package all provenance evidence for a tenant.
+
+        Fetches records from all repositories, compiles them into typed
+        AuditRecords, and assembles a cryptographically signed ZIP package.
+
+        Args:
+            tenant_id: The owning tenant.
+            scope: Evidence scope ("full", "provenance_only", "license_only", etc.).
+            filter_content_ids: Optional filter to specific content IDs.
+
+        Returns:
+            FullAuditResult with package ID and integrity hash.
+
+        Raises:
+            ValidationError: If scope is not recognized.
+        """
+        from aumos_content_provenance.adapters.audit_reporter import AuditScope
+
+        try:
+            scope_enum = AuditScope(scope)
+        except ValueError:
+            raise ValidationError(
+                f"Invalid scope '{scope}'. "
+                f"Must be one of: {[s.value for s in AuditScope]}"
+            )
+
+        # Fetch all records from repositories
+        provenance_dicts: list[dict[str, Any]] = []
+        license_dicts: list[dict[str, Any]] = []
+
+        if scope_enum in (AuditScope.PROVENANCE_ONLY, AuditScope.FULL):
+            provenance_records = await self._provenance_repo.list_by_tenant(
+                tenant_id=tenant_id, page=1, page_size=10000
+            )
+            provenance_dicts = [
+                {
+                    "content_id": r.content_id,
+                    "content_type": r.content_type,
+                    "content_hash": r.content_hash,
+                    "status": r.status.value,
+                    "signer_id": r.signer_id,
+                    "manifest_uri": r.manifest_uri,
+                    "signed_at": r.signed_at.isoformat(),
+                    "created_at": r.created_at.isoformat(),
+                }
+                for r in provenance_records
+            ]
+
+        if scope_enum in (AuditScope.LICENSE_ONLY, AuditScope.FULL):
+            license_records = await self._license_repo.list_by_tenant(
+                tenant_id=tenant_id, page=1, page_size=10000, risk_level=None
+            )
+            license_dicts = [
+                {
+                    "content_id": c.content_id,
+                    "detected_license": c.detected_license,
+                    "license_risk": c.license_risk.value,
+                    "risk_score": c.risk_score,
+                    "flags": c.flags,
+                    "recommendation": c.recommendation,
+                    "checked_at": c.checked_at.isoformat(),
+                    "created_at": c.created_at.isoformat(),
+                }
+                for c in license_records
+            ]
+
+        audit_records = await self._reporter.compile_audit_trail(
+            tenant_id=str(tenant_id),
+            scope=scope_enum,
+            provenance_records=provenance_dicts or None,
+            lineage_records=None,
+            license_records=license_dicts or None,
+            custody_records=None,
+            filter_content_ids=filter_content_ids,
+        )
+
+        package = await self._reporter.package_evidence(
+            tenant_id=str(tenant_id),
+            scope=scope_enum,
+            audit_records=audit_records,
+        )
+
+        logger.info(
+            "Full audit evidence package generated",
+            tenant_id=str(tenant_id),
+            package_id=package.package_id,
+            record_count=package.records_included,
+            zip_hash=package.zip_hash[:16] if package.zip_hash else None,
+        )
+
+        return FullAuditResult(
+            package_id=package.package_id,
+            tenant_id=str(tenant_id),
+            record_count=package.records_included,
+            zip_hash=package.zip_hash,
+            scope=scope,
+            generated_at=package.generated_at,
+        )
+
+    async def generate_expert_report(
+        self,
+        tenant_id: uuid.UUID,
+        expert_name: str,
+        case_reference: str,
+        jurisdiction: str = "US Federal",
+        scope: str = "full",
+    ) -> Any:
+        """Generate an expert witness report for court submission.
+
+        Args:
+            tenant_id: The owning tenant.
+            expert_name: Name of the expert witness.
+            case_reference: Court case reference number.
+            jurisdiction: Legal jurisdiction for the proceeding.
+            scope: Evidence scope.
+
+        Returns:
+            ExpertWitnessReport with signed attestation and report hash.
+        """
+        from aumos_content_provenance.adapters.audit_reporter import AuditScope
+
+        try:
+            scope_enum = AuditScope(scope)
+        except ValueError:
+            raise ValidationError(f"Invalid scope '{scope}'")
+
+        provenance_records = await self._provenance_repo.list_by_tenant(
+            tenant_id=tenant_id, page=1, page_size=10000
+        )
+        provenance_dicts = [
+            {
+                "content_id": r.content_id,
+                "status": r.status.value,
+                "content_hash": r.content_hash,
+                "signer_id": r.signer_id,
+                "created_at": r.created_at.isoformat(),
+            }
+            for r in provenance_records
+        ]
+
+        audit_records = await self._reporter.compile_audit_trail(
+            tenant_id=str(tenant_id),
+            scope=scope_enum,
+            provenance_records=provenance_dicts,
+            lineage_records=None,
+            license_records=None,
+            custody_records=None,
+            filter_content_ids=None,
+        )
+
+        return await self._reporter.generate_expert_witness_report(
+            tenant_id=str(tenant_id),
+            scope=scope_enum,
+            audit_records=audit_records,
+            expert_name=expert_name,
+            case_reference=case_reference,
+            jurisdiction=jurisdiction,
+        )
+
+
 __all__ = [
     "SignContentResult",
     "VerifyResult",
@@ -918,9 +1916,21 @@ __all__ = [
     "WatermarkDetectResult",
     "LineageGraph",
     "LicenseReport",
+    "ChainVerificationResult",
+    "TamperCheckResult",
+    "LineageImpactResult",
+    "FullAuditResult",
     "C2PAService",
     "WatermarkService",
     "LineageService",
     "LicenseComplianceService",
     "AuditExportService",
+    "ProvenanceTrackingService",
+    "TamperDetectionService",
+    "MetadataEmbeddingService",
+    "CustodyService",
+    "RetentionService",
+    "LineageResolverService",
+    "LicenseCheckerService",
+    "FullAuditService",
 ]
