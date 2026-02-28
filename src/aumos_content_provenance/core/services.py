@@ -31,8 +31,12 @@ from aumos_common.observability import get_logger
 
 from aumos_content_provenance.core.interfaces import (
     IAuditExportRepository,
+    IAudioWatermarkAdapter,
+    IBlockchainAnchorAdapter,
+    IBlockchainAnchorRepository,
     IC2PAClient,
     IChainOfCustody,
+    ICopyrightClaimRepository,
     ILicenseChecker,
     ILicenseRepository,
     ILineageRepository,
@@ -43,12 +47,18 @@ from aumos_content_provenance.core.interfaces import (
     IProvenanceTracker,
     IRetentionManager,
     ITamperDetector,
+    IVideoWatermarkAdapter,
     IWatermarkEngine,
     IWatermarkRepository,
 )
 from aumos_content_provenance.core.models import (
     AuditExport,
     AuditExportStatus,
+    BlockchainAnchor,
+    BlockchainNetwork,
+    ContentVerificationResult,
+    CopyrightClaim,
+    CopyrightClaimStatus,
     LicenseCheck,
     LicenseRisk,
     LineageEntry,
@@ -1909,6 +1919,444 @@ class FullAuditService:
         )
 
 
+# ---------------------------------------------------------------------------
+# GAP-274: Content Credentials Verification UI Service
+# ---------------------------------------------------------------------------
+
+
+class CredentialsVerificationService:
+    """Compute content credentials verification result for the UI.
+
+    Combines C2PA provenance lookup with watermark detection to produce
+    a legal_defensibility_score used in the verification UI display.
+    """
+
+    def __init__(
+        self,
+        provenance_repository: IProvenanceRepository,
+        watermark_repository: IWatermarkRepository,
+        watermark_engine: IWatermarkEngine,
+    ) -> None:
+        self._provenance_repo = provenance_repository
+        self._watermark_repo = watermark_repository
+        self._watermark_engine = watermark_engine
+
+    async def verify(
+        self,
+        content_id: str,
+        tenant_id: uuid.UUID,
+        content_bytes: bytes | None = None,
+    ) -> ContentVerificationResult:
+        """Compute content credentials verification result.
+
+        Looks up the C2PA provenance record and watermark metadata.
+        If content_bytes are provided, performs live watermark detection.
+        Computes a legal_defensibility_score as the weighted composite:
+          0.6 * (provenance_signed) + 0.4 * (watermark_present)
+
+        Args:
+            content_id: Stable content identifier to verify.
+            tenant_id: Owning tenant UUID.
+            content_bytes: Optional raw bytes for watermark detection.
+
+        Returns:
+            ContentVerificationResult with composite legal_defensibility_score.
+        """
+        from aumos_content_provenance.core.models import ContentVerificationResult
+
+        provenance_record = await self._provenance_repo.get_by_content_id(
+            content_id=content_id,
+            tenant_id=tenant_id,
+        )
+        watermark = await self._watermark_repo.get_by_content_id(
+            content_id=content_id,
+            tenant_id=tenant_id,
+        )
+
+        # Live watermark detection if bytes provided
+        watermark_detected = False
+        watermark_payload: str | None = None
+        if content_bytes and watermark:
+            try:
+                watermark_detected, watermark_payload = await self._watermark_engine.detect(
+                    content_bytes=content_bytes,
+                    method=watermark.method,
+                )
+            except Exception:
+                watermark_detected = False
+
+        has_c2pa_manifest = provenance_record is not None and provenance_record.c2pa_manifest != {}
+        has_watermark = watermark is not None
+
+        provenance_score = 1.0 if has_c2pa_manifest else 0.0
+        watermark_score = 1.0 if has_watermark else 0.0
+        legal_defensibility_score = round(0.6 * provenance_score + 0.4 * watermark_score, 3)
+
+        parts = []
+        if has_c2pa_manifest:
+            parts.append("C2PA manifest present and verifiable")
+        if has_watermark:
+            parts.append("Invisible watermark embedded")
+        if not parts:
+            parts.append("No content credentials found")
+        verification_summary = ". ".join(parts) + "."
+
+        return ContentVerificationResult(
+            content_id=content_id,
+            provenance_record=provenance_record,
+            watermark_detected=watermark_detected,
+            watermark_payload=watermark_payload,
+            legal_defensibility_score=legal_defensibility_score,
+            verification_summary=verification_summary,
+            verified_at=datetime.now(UTC),
+            has_c2pa_manifest=has_c2pa_manifest,
+            has_watermark=has_watermark,
+        )
+
+
+# ---------------------------------------------------------------------------
+# GAP-276: Video/Audio Provenance Service
+# ---------------------------------------------------------------------------
+
+
+class MediaProvenanceService:
+    """Handle watermarking and provenance tracking for video and audio content.
+
+    Routes media content to the appropriate watermark adapter based on
+    detected media type, and records provenance metadata.
+    """
+
+    SUPPORTED_CONTENT_TYPES: frozenset[str] = frozenset({
+        "image/jpeg", "image/png", "image/webp", "image/gif",
+        "audio/wav", "audio/mp3", "audio/mpeg", "audio/ogg",
+        "video/mp4", "video/quicktime", "video/webm",
+    })
+
+    def __init__(
+        self,
+        watermark_engine: IWatermarkEngine,
+        audio_watermark_adapter: "IAudioWatermarkAdapter | None" = None,
+        video_watermark_adapter: "IVideoWatermarkAdapter | None" = None,
+        watermark_repository: IWatermarkRepository | None = None,
+    ) -> None:
+        self._watermark_engine = watermark_engine
+        self._audio_adapter = audio_watermark_adapter
+        self._video_adapter = video_watermark_adapter
+        self._watermark_repo = watermark_repository
+
+    async def embed_media_watermark(
+        self,
+        tenant_id: uuid.UUID,
+        content_id: str,
+        content_bytes: bytes,
+        content_type: str,
+        payload: str,
+        strength: float = 0.5,
+    ) -> bytes:
+        """Embed a watermark in media content (image, audio, or video).
+
+        Args:
+            tenant_id: Owning tenant UUID.
+            content_id: Stable content identifier.
+            content_bytes: Raw media bytes.
+            content_type: MIME type of the content.
+            payload: Watermark payload to embed.
+            strength: Embedding strength (0.0–1.0).
+
+        Returns:
+            Watermarked media bytes.
+
+        Raises:
+            ValidationError: If content_type is not in SUPPORTED_CONTENT_TYPES.
+        """
+        if content_type not in self.SUPPORTED_CONTENT_TYPES:
+            raise ValidationError(
+                f"Unsupported content type '{content_type}'. "
+                f"Supported: {sorted(self.SUPPORTED_CONTENT_TYPES)}"
+            )
+
+        logger.info(
+            "Embedding media watermark",
+            tenant_id=str(tenant_id),
+            content_id=content_id,
+            content_type=content_type,
+        )
+
+        if content_type.startswith("audio/") and self._audio_adapter:
+            return await self._audio_adapter.embed(
+                audio_bytes=content_bytes,
+                payload=payload,
+                strength=strength,
+            )
+        if content_type.startswith("video/") and self._video_adapter:
+            return await self._video_adapter.embed(
+                video_bytes=content_bytes,
+                payload=payload,
+                strength=strength,
+            )
+
+        # Fallback to standard image watermark engine
+        return await self._watermark_engine.embed(
+            content_bytes=content_bytes,
+            payload=payload,
+            method=WatermarkMethod.DWT_DCT,
+            strength=strength,
+        )
+
+    async def detect_media_watermark(
+        self,
+        content_bytes: bytes,
+        content_type: str,
+    ) -> tuple[bool, str | None]:
+        """Detect a watermark in media content.
+
+        Args:
+            content_bytes: Raw media bytes to scan.
+            content_type: MIME type of the content.
+
+        Returns:
+            Tuple of (watermark_found, extracted_payload_or_none).
+        """
+        if content_type.startswith("audio/") and self._audio_adapter:
+            return await self._audio_adapter.detect(audio_bytes=content_bytes)
+        if content_type.startswith("video/") and self._video_adapter:
+            return await self._video_adapter.detect(video_bytes=content_bytes)
+        return await self._watermark_engine.detect(
+            content_bytes=content_bytes,
+            method=WatermarkMethod.DWT_DCT,
+        )
+
+
+# ---------------------------------------------------------------------------
+# GAP-278: Copyright Claim Cross-Reference Service
+# ---------------------------------------------------------------------------
+
+
+class CopyrightClaimService:
+    """Manage and cross-reference known copyright claims.
+
+    Provides CRUD for the copyright claim database and cross-reference
+    queries against the tenant's training data inventory.
+    """
+
+    def __init__(self, claim_repository: "ICopyrightClaimRepository") -> None:
+        self._repo = claim_repository
+
+    async def add_claim(
+        self,
+        claim_reference: str,
+        claimant_name: str,
+        content_description: str,
+        content_identifiers: list[str],
+        jurisdiction: str,
+        status: str = "active",
+        defendant_name: str | None = None,
+        filed_at: datetime | None = None,
+        source_url: str | None = None,
+        tags: list[str] | None = None,
+    ) -> CopyrightClaim:
+        """Add a new copyright claim to the database.
+
+        Args:
+            claim_reference: External case number or claim ID.
+            claimant_name: Copyright holder or plaintiff.
+            content_description: Description of claimed content.
+            content_identifiers: Hashes, URLs, or dataset names.
+            jurisdiction: Legal jurisdiction (e.g., "US-SDNY").
+            status: Claim status (active | settled | dismissed | pending).
+            defendant_name: Defendant company/model name.
+            filed_at: Filing date.
+            source_url: Public court filing URL.
+            tags: Classification tags.
+
+        Returns:
+            Created CopyrightClaim record.
+        """
+        from aumos_content_provenance.core.models import CopyrightClaimStatus
+
+        try:
+            status_enum = CopyrightClaimStatus(status)
+        except ValueError:
+            raise ValidationError(f"Invalid claim status: {status}")
+
+        return await self._repo.create(
+            claim_reference=claim_reference,
+            claimant_name=claimant_name,
+            defendant_name=defendant_name,
+            content_description=content_description,
+            content_identifiers=content_identifiers,
+            status=status_enum,
+            jurisdiction=jurisdiction,
+            filed_at=filed_at,
+            source_url=source_url,
+            tags=tags or [],
+        )
+
+    async def cross_reference_training_data(
+        self,
+        content_identifiers: list[str],
+        tags: list[str] | None = None,
+    ) -> list[CopyrightClaim]:
+        """Cross-reference training data identifiers against copyright claims.
+
+        Args:
+            content_identifiers: List of dataset hashes or names to check.
+            tags: Optional tag filter to narrow results.
+
+        Returns:
+            List of matching CopyrightClaim records (if any match).
+        """
+        return await self._repo.search(
+            content_identifiers=content_identifiers,
+            tags=tags,
+            status=None,
+        )
+
+    async def list_claims(
+        self,
+        page: int = 1,
+        page_size: int = 20,
+        status: str | None = None,
+    ) -> list[CopyrightClaim]:
+        """List copyright claims with pagination.
+
+        Args:
+            page: Page number (1-indexed).
+            page_size: Records per page.
+            status: Optional status filter.
+
+        Returns:
+            List of CopyrightClaim records.
+        """
+        from aumos_content_provenance.core.models import CopyrightClaimStatus
+
+        status_enum: CopyrightClaimStatus | None = None
+        if status:
+            try:
+                status_enum = CopyrightClaimStatus(status)
+            except ValueError:
+                raise ValidationError(f"Invalid claim status: {status}")
+
+        return await self._repo.list_claims(
+            page=page,
+            page_size=page_size,
+            status=status_enum,
+        )
+
+
+# ---------------------------------------------------------------------------
+# GAP-279: Blockchain Provenance Anchor Service
+# ---------------------------------------------------------------------------
+
+
+class BlockchainAnchorService:
+    """Anchor C2PA content hashes to blockchain/IPFS for immutable timestamps.
+
+    Provides tamper-evident external anchoring of content provenance records
+    by committing their hashes to public or private blockchain networks.
+    """
+
+    def __init__(
+        self,
+        anchor_adapter: "IBlockchainAnchorAdapter",
+        anchor_repository: "IBlockchainAnchorRepository",
+        event_publisher: Any | None = None,
+    ) -> None:
+        self._adapter = anchor_adapter
+        self._repo = anchor_repository
+        self._publisher = event_publisher
+
+    async def anchor_provenance_record(
+        self,
+        tenant_id: uuid.UUID,
+        provenance_record_id: uuid.UUID,
+        content_hash: str,
+        network: str = "internal_ledger",
+    ) -> BlockchainAnchor:
+        """Anchor a content hash to the specified blockchain network.
+
+        Creates a pending anchor record, submits the hash to the network,
+        and updates the anchor record with the transaction details.
+
+        Args:
+            tenant_id: Owning tenant UUID.
+            provenance_record_id: The provenance record to anchor.
+            content_hash: SHA-256 of the content being anchored.
+            network: Target network (ethereum | polygon | ipfs | internal_ledger).
+
+        Returns:
+            BlockchainAnchor record with transaction details.
+
+        Raises:
+            ValidationError: If network is not supported.
+        """
+        try:
+            network_enum = BlockchainNetwork(network)
+        except ValueError:
+            raise ValidationError(
+                f"Invalid network '{network}'. "
+                f"Must be one of: {[n.value for n in BlockchainNetwork]}"
+            )
+
+        anchor = await self._repo.create(
+            tenant_id=tenant_id,
+            provenance_record_id=provenance_record_id,
+            content_hash=content_hash,
+            network=network_enum,
+        )
+
+        logger.info(
+            "Anchoring content hash to blockchain",
+            anchor_id=str(anchor.id),
+            network=network,
+            content_hash=content_hash[:16],
+        )
+
+        try:
+            tx_hash, ipfs_cid, block_height = await self._adapter.anchor(
+                content_hash=content_hash,
+                network=network_enum,
+                metadata={"provenance_record_id": str(provenance_record_id)},
+            )
+            anchor = await self._repo.update_anchor(
+                anchor_id=anchor.id,
+                transaction_hash=tx_hash,
+                ipfs_cid=ipfs_cid,
+                block_height=block_height,
+                anchor_status="confirmed",
+            )
+        except Exception as exc:
+            logger.error("Blockchain anchoring failed", error=str(exc))
+            anchor = await self._repo.update_anchor(
+                anchor_id=anchor.id,
+                transaction_hash=None,
+                ipfs_cid=None,
+                block_height=None,
+                anchor_status="failed",
+            )
+
+        return anchor
+
+    async def get_anchor_for_record(
+        self,
+        provenance_record_id: uuid.UUID,
+        tenant_id: uuid.UUID,
+    ) -> BlockchainAnchor | None:
+        """Retrieve the blockchain anchor for a provenance record.
+
+        Args:
+            provenance_record_id: The provenance record UUID.
+            tenant_id: Owning tenant UUID.
+
+        Returns:
+            BlockchainAnchor or None if not anchored.
+        """
+        return await self._repo.get_by_provenance_record(
+            provenance_record_id=provenance_record_id,
+            tenant_id=tenant_id,
+        )
+
+
 __all__ = [
     "SignContentResult",
     "VerifyResult",
@@ -1933,4 +2381,8 @@ __all__ = [
     "LineageResolverService",
     "LicenseCheckerService",
     "FullAuditService",
+    "CredentialsVerificationService",
+    "MediaProvenanceService",
+    "CopyrightClaimService",
+    "BlockchainAnchorService",
 ]

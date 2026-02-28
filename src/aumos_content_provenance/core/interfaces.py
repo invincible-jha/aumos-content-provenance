@@ -15,6 +15,11 @@ from typing import Any, Protocol, runtime_checkable
 from aumos_content_provenance.core.models import (
     AuditExport,
     AuditExportStatus,
+    BlockchainAnchor,
+    BlockchainNetwork,
+    ContentVerificationResult,
+    CopyrightClaim,
+    CopyrightClaimStatus,
     LicenseCheck,
     LicenseRisk,
     LineageEntry,
@@ -995,6 +1000,298 @@ class IProvenanceAuditReporter(Protocol):
         ...
 
 
+# ---------------------------------------------------------------------------
+# GAP-274: Content Credentials Verification UI Interface
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class IContentVerificationService(Protocol):
+    """Interface for computing content credentials verification results."""
+
+    async def verify(
+        self,
+        content_id: str,
+        tenant_id: uuid.UUID,
+        content_bytes: bytes | None,
+    ) -> ContentVerificationResult:
+        """Compute the verification result and legal defensibility score.
+
+        Args:
+            content_id: Stable content identifier to verify.
+            tenant_id: Owning tenant UUID.
+            content_bytes: Optional raw bytes for watermark detection.
+
+        Returns:
+            ContentVerificationResult with legal_defensibility_score.
+        """
+        ...
+
+
+# ---------------------------------------------------------------------------
+# GAP-276: Video/Audio Watermark Interfaces
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class IAudioWatermarkAdapter(Protocol):
+    """Interface for embedding and detecting watermarks in audio content."""
+
+    async def embed(
+        self,
+        audio_bytes: bytes,
+        payload: str,
+        strength: float,
+    ) -> bytes:
+        """Embed an inaudible watermark into audio content.
+
+        Args:
+            audio_bytes: Raw PCM/WAV/MP3 bytes.
+            payload: Payload to embed.
+            strength: Embedding strength (0.0–1.0).
+
+        Returns:
+            Watermarked audio bytes.
+        """
+        ...
+
+    async def detect(
+        self,
+        audio_bytes: bytes,
+    ) -> tuple[bool, str | None]:
+        """Detect an inaudible watermark in audio content.
+
+        Args:
+            audio_bytes: Audio bytes to analyse.
+
+        Returns:
+            Tuple of (watermark_found, extracted_payload_or_none).
+        """
+        ...
+
+
+@runtime_checkable
+class IVideoWatermarkAdapter(Protocol):
+    """Interface for embedding and detecting watermarks in video content."""
+
+    async def embed(
+        self,
+        video_bytes: bytes,
+        payload: str,
+        strength: float,
+    ) -> bytes:
+        """Embed an invisible watermark into video content.
+
+        Args:
+            video_bytes: Raw video bytes (MP4/MOV/AVI).
+            payload: Payload to embed in video frames.
+            strength: Embedding strength (0.0–1.0).
+
+        Returns:
+            Watermarked video bytes.
+        """
+        ...
+
+    async def detect(
+        self,
+        video_bytes: bytes,
+    ) -> tuple[bool, str | None]:
+        """Detect an invisible watermark in video content.
+
+        Args:
+            video_bytes: Video bytes to analyse.
+
+        Returns:
+            Tuple of (watermark_found, extracted_payload_or_none).
+        """
+        ...
+
+
+# ---------------------------------------------------------------------------
+# GAP-278: Copyright Claim Database Interface
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class ICopyrightClaimRepository(Protocol):
+    """Repository interface for copyright claim records."""
+
+    async def create(
+        self,
+        claim_reference: str,
+        claimant_name: str,
+        defendant_name: str | None,
+        content_description: str,
+        content_identifiers: list[str],
+        status: CopyrightClaimStatus,
+        jurisdiction: str,
+        filed_at: datetime | None,
+        source_url: str | None,
+        tags: list[str],
+    ) -> CopyrightClaim:
+        """Record a new copyright claim.
+
+        Args:
+            claim_reference: External case number or claim ID.
+            claimant_name: Copyright holder or plaintiff.
+            defendant_name: Defendant company/model name.
+            content_description: Description of claimed content.
+            content_identifiers: Hashes, URLs, or dataset names.
+            status: Initial claim status.
+            jurisdiction: Legal jurisdiction.
+            filed_at: Filing date.
+            source_url: Public court filing URL.
+            tags: Classification tags.
+
+        Returns:
+            The created CopyrightClaim record.
+        """
+        ...
+
+    async def search(
+        self,
+        content_identifiers: list[str],
+        tags: list[str] | None,
+        status: CopyrightClaimStatus | None,
+    ) -> list[CopyrightClaim]:
+        """Search copyright claims by content identifier cross-reference.
+
+        Args:
+            content_identifiers: Hashes or dataset names to cross-reference.
+            tags: Optional tag filter (e.g., ["generative_ai"]).
+            status: Optional status filter.
+
+        Returns:
+            List of matching CopyrightClaim records.
+        """
+        ...
+
+    async def list_claims(
+        self,
+        page: int,
+        page_size: int,
+        status: CopyrightClaimStatus | None,
+    ) -> list[CopyrightClaim]:
+        """List all copyright claims with pagination.
+
+        Args:
+            page: Page number (1-indexed).
+            page_size: Records per page.
+            status: Optional status filter.
+
+        Returns:
+            List of CopyrightClaim records.
+        """
+        ...
+
+
+# ---------------------------------------------------------------------------
+# GAP-279: Blockchain Anchor Interface
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class IBlockchainAnchorAdapter(Protocol):
+    """Interface for anchoring content hashes to blockchain/IPFS."""
+
+    async def anchor(
+        self,
+        content_hash: str,
+        network: BlockchainNetwork,
+        metadata: dict[str, Any],
+    ) -> tuple[str | None, str | None, int | None]:
+        """Anchor a content hash to the specified network.
+
+        Args:
+            content_hash: SHA-256 of content to anchor.
+            network: Target blockchain network or IPFS.
+            metadata: Additional metadata to include in the anchor payload.
+
+        Returns:
+            Tuple of (transaction_hash_or_none, ipfs_cid_or_none, block_height_or_none).
+        """
+        ...
+
+    async def check_confirmation(
+        self,
+        transaction_hash: str,
+        network: BlockchainNetwork,
+    ) -> int:
+        """Check the number of block confirmations for a transaction.
+
+        Args:
+            transaction_hash: On-chain transaction hash.
+            network: Blockchain network.
+
+        Returns:
+            Number of block confirmations.
+        """
+        ...
+
+
+@runtime_checkable
+class IBlockchainAnchorRepository(Protocol):
+    """Repository interface for BlockchainAnchor records."""
+
+    async def create(
+        self,
+        tenant_id: uuid.UUID,
+        provenance_record_id: uuid.UUID,
+        content_hash: str,
+        network: BlockchainNetwork,
+    ) -> BlockchainAnchor:
+        """Create a pending blockchain anchor record.
+
+        Args:
+            tenant_id: Owning tenant UUID.
+            provenance_record_id: The provenance record being anchored.
+            content_hash: SHA-256 of content.
+            network: Target network.
+
+        Returns:
+            The created BlockchainAnchor record with pending status.
+        """
+        ...
+
+    async def update_anchor(
+        self,
+        anchor_id: uuid.UUID,
+        transaction_hash: str | None,
+        ipfs_cid: str | None,
+        block_height: int | None,
+        anchor_status: str,
+    ) -> BlockchainAnchor:
+        """Update an anchor record with on-chain confirmation details.
+
+        Args:
+            anchor_id: Anchor record UUID.
+            transaction_hash: On-chain transaction hash.
+            ipfs_cid: IPFS CID if applicable.
+            block_height: Block height at confirmation.
+            anchor_status: New status (confirmed | failed).
+
+        Returns:
+            Updated BlockchainAnchor record.
+        """
+        ...
+
+    async def get_by_provenance_record(
+        self,
+        provenance_record_id: uuid.UUID,
+        tenant_id: uuid.UUID,
+    ) -> BlockchainAnchor | None:
+        """Retrieve anchor for a provenance record.
+
+        Args:
+            provenance_record_id: The provenance record UUID.
+            tenant_id: Owning tenant UUID.
+
+        Returns:
+            BlockchainAnchor or None.
+        """
+        ...
+
+
 __all__ = [
     "IC2PAClient",
     "IWatermarkEngine",
@@ -1011,4 +1308,10 @@ __all__ = [
     "ILineageResolver",
     "ILicenseChecker",
     "IProvenanceAuditReporter",
+    "IContentVerificationService",
+    "IAudioWatermarkAdapter",
+    "IVideoWatermarkAdapter",
+    "ICopyrightClaimRepository",
+    "IBlockchainAnchorAdapter",
+    "IBlockchainAnchorRepository",
 ]

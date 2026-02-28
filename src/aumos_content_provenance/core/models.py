@@ -185,15 +185,163 @@ class AuditExport:
     error_message: str | None = field(default=None)
 
 
+# ---------------------------------------------------------------------------
+# GAP-274: Content Credentials Verification UI
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ContentVerificationResult:
+    """Result of a content credentials verification UI check.
+
+    Computes a legal defensibility score and provides human-readable
+    provenance summary for display in the verification UI.
+
+    Not persisted as a table — computed on demand.
+    """
+
+    content_id: str
+    provenance_record: "ProvenanceRecord | None"
+    watermark_detected: bool
+    watermark_payload: str | None
+    legal_defensibility_score: float      # 0.0–1.0; composite of provenance + watermark
+    verification_summary: str
+    verified_at: datetime
+    has_c2pa_manifest: bool
+    has_watermark: bool
+
+
+# ---------------------------------------------------------------------------
+# GAP-276: Video/Audio Provenance
+# ---------------------------------------------------------------------------
+
+
+class MediaProvenanceType(str, Enum):
+    """Media type for video/audio provenance tracking."""
+
+    VIDEO = "video"
+    AUDIO = "audio"
+    IMAGE = "image"
+    DOCUMENT = "document"
+
+
+@dataclass
+class MediaProvenanceRecord:
+    """Extended provenance record for video/audio media content.
+
+    Tracks codec metadata, duration, frame/sample counts, and
+    AI-generation flags alongside standard C2PA provenance data.
+
+    Not persisted separately — stored as metadata on ProvenanceRecord.
+    """
+
+    content_id: str
+    tenant_id: uuid.UUID
+    media_type: MediaProvenanceType
+    codec: str | None
+    duration_seconds: float | None
+    frame_count: int | None
+    sample_rate_hz: int | None
+    is_ai_generated: bool
+    ai_model_id: str | None
+    creation_timestamp: datetime | None
+    provenance_record_id: uuid.UUID | None
+
+
+# ---------------------------------------------------------------------------
+# GAP-278: Known Copyright Claim Database
+# ---------------------------------------------------------------------------
+
+
+class CopyrightClaimStatus(str, Enum):
+    """Status of a copyright claim record."""
+
+    ACTIVE = "active"
+    SETTLED = "settled"
+    DISMISSED = "dismissed"
+    PENDING = "pending"
+
+
+@dataclass
+class CopyrightClaim:
+    """A known copyright claim record from public lawsuit databases.
+
+    Tracks filed lawsuits, claimants, and content identifiers to enable
+    cross-referencing against the tenant's training data inventory.
+
+    Table: cpv_copyright_claims
+    """
+
+    id: uuid.UUID
+    claim_reference: str               # External case number or claim ID
+    claimant_name: str                 # Copyright holder or plaintiff
+    defendant_name: str | None         # Defendant company/model name
+    content_description: str          # Description of the claimed content
+    content_identifiers: list[str]    # Hashes, URLs, or dataset names
+    status: CopyrightClaimStatus
+    jurisdiction: str                  # Legal jurisdiction (e.g., "US-SDNY")
+    filed_at: datetime | None
+    resolved_at: datetime | None
+    source_url: str | None             # Public court filing URL
+    tags: list[str]                    # e.g., ["generative_ai", "training_data"]
+    created_at: datetime
+
+
+# ---------------------------------------------------------------------------
+# GAP-279: Blockchain Provenance Anchor
+# ---------------------------------------------------------------------------
+
+
+class BlockchainNetwork(str, Enum):
+    """Supported blockchain networks for provenance anchoring."""
+
+    ETHEREUM = "ethereum"
+    POLYGON = "polygon"
+    IPFS = "ipfs"
+    INTERNAL_LEDGER = "internal_ledger"  # Air-gapped internal notarisation
+
+
+@dataclass
+class BlockchainAnchor:
+    """Blockchain/IPFS provenance anchor for a content record.
+
+    Records the transaction hash and block height of the on-chain
+    commitment, providing an immutable external timestamp for
+    C2PA content provenance records.
+
+    Table: cpv_blockchain_anchors
+    """
+
+    id: uuid.UUID
+    tenant_id: uuid.UUID
+    provenance_record_id: uuid.UUID
+    content_hash: str                  # SHA-256 of content being anchored
+    network: BlockchainNetwork
+    transaction_hash: str | None       # On-chain transaction ID
+    block_height: int | None
+    ipfs_cid: str | None               # IPFS content ID if anchored to IPFS
+    anchor_status: str                 # pending | confirmed | failed
+    anchored_at: datetime | None
+    confirmation_count: int            # Block confirmations received
+    created_at: datetime
+
+
 __all__ = [
     "ProvenanceStatus",
     "WatermarkMethod",
     "LineageNodeType",
     "LicenseRisk",
     "AuditExportStatus",
+    "MediaProvenanceType",
+    "CopyrightClaimStatus",
+    "BlockchainNetwork",
     "ProvenanceRecord",
     "Watermark",
     "LineageEntry",
     "LicenseCheck",
     "AuditExport",
+    "ContentVerificationResult",
+    "MediaProvenanceRecord",
+    "CopyrightClaim",
+    "BlockchainAnchor",
 ]
